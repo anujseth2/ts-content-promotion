@@ -1,0 +1,1893 @@
+"""
+Classify ThoughtSpot TML import / VALIDATE_ONLY errors into reviewer-actionable
+findings, and apply a reviewer's "drop" choice to the promotion set.
+
+Grounded in the exact messages observed live (a live test cluster, 2026-06-25):
+
+  source-extra  — a column referenced by the source but absent from the target
+                  WAREHOUSE. Import HARD-FAILS (error_code 14536):
+                    "External column with name: <db.schema.table.col> does not
+                     exist in connection <conn>."
+                  Reviewer choice: add the column to the target warehouse and
+                  re-run (default), OR drop it from the promotion (+ its vizs).
+
+  target-extra  — a column on the target table that the source TML omits.
+    no dependents  -> import SILENTLY drops it (status OK, no message). The
+                      platform won't warn; the matcher's pre-import column diff
+                      is the only signal.
+    with dependents-> import HARD-FAILS, blocked + names the dependents:
+                      "Deleted columns have dependents.<br/>- <b>COL</b>
+                       <ul><li>DEPENDENT</li></ul> ... SOLUTION: ..."
+                      Reviewer choice: preserve the column (carry it through) OR
+                      remove the dependents on the target first.
+
+  type_mismatch — a column exists on BOTH sides but its declared type (carried
+                  from the SOURCE warehouse) does not match the TARGET warehouse's
+                  physical type. Import HARD-FAILS at VALIDATE_ONLY:
+                    "DataType <T> does not match CDW DataType for column with name
+                     <db.schema.table.col> in connection <conn>."
+                  The message names the SOURCE-declared type (<T>) but NOT the
+                  target's; the target's actual type comes from the target table's
+                  column_signature (compare_columns -> type_mismatch).
+                  Reviewer choice: retype the promoted column to the target's type
+                  (column + dependents survive), align the target warehouse (data
+                  team), or drop it + its dependents.
+"""
+
+import json
+import re
+from typing import Dict, List, Tuple
+
+from services.table_matcher import column_signature, compare_columns
+
+_MISSING_WH = re.compile(r"External column with name:\s*(\S+?)\s+does not exist in connection\s+(.+?)\.", re.I)
+_TYPE_MISMATCH = re.compile(
+    r"DataType\s+(\S+)\s+does not match CDW DataType for column with name\s+(\S+?)\s+in connection\s+(.+?)\.",
+    re.I)
+_DEP_HEADER = re.compile(r"Deleted columns have dependents", re.I)
+_BOLD = re.compile(r"<b>(.*?)</b>", re.I | re.S)
+_LI = re.compile(r"<li>(.*?)</li>", re.I | re.S)
+_VIZ_ERR = re.compile(r"Visualization\s*<b>\s*(.*?)\s*</b>\s*has following errors", re.I | re.S)
+_FORMULA = re.compile(r"Formula:\s*([^,<]+)", re.I)
+# "Unable to create model column(s). These column_id/formula_id values are incorrect:<br/>
+#  fact_regional_account_bridge_east_br::ACCOUNT_AGE"
+# A model column whose underlying table column never got created. Always a CONSEQUENCE of the
+# table's own failure (Customer run 2026-09-11: ACCOUNT_AGE failed its type check, so the model referencing
+# it failed too). The header carries no object name, so this used to land in "other" as an
+# unactionable "unknown" — while the body names the culprit precisely, as table::column.
+_MODEL_COL_BAD = re.compile(r"Unable to create model column\(s\).*?column_id/formula_id values are "
+                            r"incorrect\s*:?(.*)$", re.I | re.S)
+# "Formula addition failed. Formula: test_promotion_tool, Error: Search did not find
+#  "fact_regional_account_features_east_br::SUA_ACCOUNTS" in your data or metadata."
+# A formula whose expression references a column that is no longer in the promotion (usually one
+# the operator dropped). Names both halves, so say which formula and which column rather than
+# dumping it in "other". Distinct from dangling_ref, which is formula-references-formula.
+_FORMULA_BAD_REF = re.compile(
+    r"Formula addition failed\.\s*Formula:\s*([^,]+?)\s*,\s*Error:\s*Search did not find\s*"
+    r"[\"“]?([^\"”]+?)[\"”]?\s+in your data or metadata", re.I | re.S)
+_SCOPED_REF = re.compile(r"([A-Za-z0-9_\-. ]+?)\s*::\s*([A-Za-z0-9_\-. ]+)")
+# "One or more tables have been added to the model without selecting any of their columns. … select
+#  at least one column or formula from each of the following tables or remove them from the canvas:
+#  <br/><li>dim_territory_bridge_west</li>"
+# A model table left on the canvas with none of its columns surfaced — usually the tail end of a
+# drop cascade. ThoughtSpot refuses the model, because such a table can produce unintended cross
+# joins between facts.
+_NO_COLS_SELECTED = re.compile(
+    r"tables have been added to the model without selecting any of their columns(.*)$", re.I | re.S)
+# "DataType is being changed for column having name CALLS and db_column_name CALLS. This change may
+#  break the dependents models/worksheets, answers, etc of this column."
+# ThoughtSpot returns this with status WARNING, not ERROR. It is the platform CONFIRMING a type
+# realignment and noting that dependents may be affected — i.e. the realign worked. It is not a
+# problem to resolve, and counting it as one reported a successful promotion as "2 issues".
+_TYPE_CHANGING = re.compile(
+    r"DataType is being changed for column having name\s+(.+?)\s+and db_column_name\s+([^.]+?)\s*\.",
+    re.I)
+# "Error: Tables do not exist. <br/>- <b>fact_x</b><br/><br/>- <b>dim_y</b>"
+_TABLES_MISSING = re.compile(r"Tables do not exist\.?(.*)$", re.I | re.S)
+# "Attempting to create a table with 0 columns. Not allowed."
+_ZERO_COLUMNS = re.compile(r"Attempting to create a table with 0 columns", re.I)
+# "Data type bigint is not valid for column having name ACCT_ID and db_column_name ACCT_ID."
+# The TML carries a RAW WAREHOUSE type where a TS token belongs. This is the failure mode a realign
+# causes if it ever writes 'bigint' instead of 'INT64', so it is worth naming loudly rather than
+# leaving as an opaque "other" — it points at our own output, not the customer's warehouse.
+_BAD_TYPE_TOKEN = re.compile(
+    r"Data type\s+(\S+?)\s+is not valid for column having name\s+(.+?)\s+and db_column_name"
+    r"\s+([^.]+?)\s*\.", re.I)
+# AUTHORIZATION_FAILURE payload: names the pre-existing target objects the account may not update.
+_AUTHZ_OBJECTS = re.compile(
+    r"AUTHORIZATION_FAILURE.*?No permission to update objects\s*:\s*(\{.*?\})", re.I | re.S)
+# "Model/Worksheet columns have invalid properties.<br/><ul><li><b>tbl::DAY_DATE_FIELD</b>
+#  <ul><li>calendar</li></ul></li></ul>SOLUTION: ..."
+# The verbatim message ends "SOLUTION: Use one of the valid properties", so the platform is
+# rejecting the property NAME on a model column, not reporting a missing object. Seen with
+# `calendar` on DAY_DATE_FIELD: the source emits it, the target's TML schema has no slot for it.
+# The body names the column AND the property; matching only the stable leading sentence keeps this
+# working regardless of how the trailing SOLUTION text is worded.
+_INVALID_COL_PROPS = re.compile(
+    r"Model/Worksheet columns have invalid properties\.?(.*)$", re.I | re.S)
+
+
+def _clean(msg: str) -> str:
+    """Strip ThoughtSpot's HTML flecks: <br/> -> newline, <b>..</b> -> **..**, list items -> lines.
+
+    List markup matters: the "tables without selected columns" error carries the table names inside
+    <li>…</li>, and without this they render to the operator as the literal text
+    "<li>dim_territory_bridge_west</li>" (seen on screen, Customer run 2026-09-11)."""
+    s = str(msg or "")
+    for br in ("<br/>", "<br />", "<br>", "</br>", "</li>", "</ul>", "</ol>"):
+        s = s.replace(br, "\n")
+    for drop in ("<ul>", "<ol>"):
+        s = s.replace(drop, "")
+    # A list item always STARTS a line. Without the newline a nested <ul><li> ran onto the end of
+    # its parent item ("tbl::DAY_DATE_FIELD**- calendar"), which both parsed wrong and read wrong.
+    s = s.replace("<li>", "\n- ")
+    s = s.replace("<b>", "**").replace("</b>", "**")
+    return "\n".join(ln.rstrip() for ln in s.split("\n")).strip()
+
+
+# Plain-language translations for the error shapes ThoughtSpot returns verbatim. Each entry:
+# (compiled pattern, lambda match -> (headline, what_to_do)). First match wins.
+def _guids_by_type(blob):
+    """{"LOGICAL_TABLE": "<guid>, <guid>"} from the JSON-ish object ThoughtSpot embeds in an
+    AUTHORIZATION_FAILURE payload. Falls back to a regex scrape when it isn't valid JSON."""
+    try:
+        d = json.loads(blob)
+        if isinstance(d, dict):
+            return {str(k): ", ".join(str(x) for x in (v if isinstance(v, list) else [v]))
+                    for k, v in d.items() if v}
+    except Exception:
+        pass
+    out = {}
+    for typ, ids in re.findall(r'"([A-Z_]+)"\s*:\s*\[([^\]]*)\]', blob or ""):
+        g = re.findall(r'"([^"]+)"', ids)
+        if g:
+            out[typ] = ", ".join(g)
+    return out
+
+
+def friendly_error(msg: str):
+    """Return (None, None, cleaned_raw) — the platform's own words, tidied for display.
+
+    The hint layer that used to live here is GONE, deliberately. It paraphrased ThoughtSpot's
+    errors from single observed strings and was wrong twice in a week: a `calendar` property is
+    not a schema-version gap, and a 204 from metadata/delete is not a successful delete. It was
+    also largely redundant — classify_import_errors already pulls the column, table and dependent
+    names out of the payload and routes them to a section with real controls, and the platform
+    ships its own SOLUTION: line, normalised by the people who emit the error.
+
+    The tuple shape is kept so callers need no change: headline and action are always None, so
+    every caller falls through to showing the raw text, which is the correct default.
+    """
+    return None, None, _clean(msg)
+
+
+def classify_import_errors(results):
+    """results: [{'name','type','status','error'}] from TSClient.import_tml.
+    Returns findings: list of {kind, object, ...}:
+      missing_in_target_warehouse  -> column, column_fqn, connection
+      drop_blocked_by_dependents   -> columns[], dependents[]
+      type_mismatch                -> column, column_fqn, source_type, connection
+      viz_error                    -> vizzes[], formulas[], error   (liveboard/answer viz fails to load)
+      model_column_unresolved      -> column, model, error   (symptom of the table's own failure)
+      other                        -> error
+    """
+    findings = []
+    for r in results:
+        _status = (r.get("status") or "").upper()
+        if _status == "OK":
+            continue
+        # WARNING is not a blocker. ThoughtSpot uses it to acknowledge something it accepted (a type
+        # realignment, say) while flagging a consequence. Every finding from this result carries the
+        # severity, so callers can report warnings without counting them as issues or feeding them
+        # into the auto-resolve loop.
+        _sev = "warning" if _status == "WARNING" else "error"
+        _start = len(findings)
+        msg = r.get("error") or ""
+        matched = False
+        for col_fqn, conn in _MISSING_WH.findall(msg):
+            matched = True
+            _p = [x for x in col_fqn.split(".") if x]
+            findings.append({"kind": "missing_in_target_warehouse",
+                             # The validate header is often "unknown", but the error FQN
+                             # (db.schema.db_table.col) names the real table — use it so the drop
+                             # scopes to <table>::<col>. "unknown::col" matched nothing, which is
+                             # why these columns never cleared.
+                             "object": _p[-2] if len(_p) >= 2 else r.get("name"),
+                             "column": _p[-1] if _p else col_fqn,
+                             "column_fqn": col_fqn,
+                             "connection": conn.strip()})
+        for src_type, col_fqn, conn in _TYPE_MISMATCH.findall(msg):
+            matched = True
+            _p = [x for x in col_fqn.split(".") if x]
+            findings.append({"kind": "type_mismatch",
+                             "object": _p[-2] if len(_p) >= 2 else r.get("name"),
+                             "column": _p[-1] if _p else col_fqn,
+                             "column_fqn": col_fqn,
+                             "source_type": src_type.strip(),
+                             "connection": conn.strip()})
+        if _DEP_HEADER.search(msg):
+            matched = True
+            made = False
+            # Format A (14544): "…- <b>TABLE</b>: Deleted columns have dependents." — names ONLY the
+            # blocked table (no column/dependent). Offending columns = the missing/type findings for
+            # the same table; dependents live on the target (operator removes them there).
+            for tbl in re.findall(r"<b>([^<]+)</b>\s*:\s*Deleted columns have dependents", msg):
+                if tbl.strip():
+                    findings.append({"kind": "drop_blocked_by_dependents", "object": tbl.strip(),
+                                     "columns": [], "dependents": []})
+                    made = True
+            # Format B: "Deleted columns have dependents.<br/>- <b>COLUMN</b><ul><li>DEP</li>…</ul>"
+            # — names the deleted COLUMN and its dependent object(s). Far more actionable.
+            for m in re.finditer(
+                    r"Deleted columns have dependents\.\s*<br/?>\s*-\s*<b>([^<]+)</b>(.*?)</ul>",
+                    msg, re.S):
+                col  = m.group(1).strip()
+                deps = [d.strip() for d in re.findall(r"<li>([^<]+)</li>", m.group(2)) if d.strip()]
+                if col:
+                    findings.append({"kind": "drop_blocked_by_dependents", "object": r.get("name"),
+                                     "column": col, "columns": [col], "dependents": deps})
+                    made = True
+            if not made:
+                findings.append({"kind": "drop_blocked_by_dependents", "object": r.get("name"),
+                                 "columns": [], "dependents": []})
+        viz_ids = _VIZ_ERR.findall(msg)
+        if viz_ids:
+            matched = True
+            findings.append({"kind": "viz_error",
+                             "object": r.get("name"),
+                             "vizzes": [v.strip() for v in viz_ids],
+                             "formulas": [f.strip() for f in _FORMULA.findall(msg)],
+                             "error": msg.strip()})
+        if re.search(r"invalid formula IDs", msg, re.I):
+            matched = True
+            # The <b>…</b> entries are the formula display names whose `formula_<name>` column_id
+            # no longer resolves (orphaned/broken). Dropping those columns (by formula name)
+            # resolves it — that's the reviewer action offered in the UI.
+            fnames = [b.strip() for b in _BOLD.findall(msg)
+                      if b.strip() and not b.strip().endswith(":")]
+            findings.append({"kind": "invalid_formula_ids",
+                             "object": r.get("name"), "formulas": fnames, "error": msg.strip()})
+        for _fml, _ref in _FORMULA_BAD_REF.findall(msg):
+            matched = True
+            _rp = [x.strip() for x in _ref.split("::")]
+            # Dropped, and named in the drop report. A formula whose column is gone cannot compute;
+            # leaving it in place just fails the import again. drop_columns already cascades
+            # formulas when the operator drops a column, so reaching this means one slipped through
+            # (e.g. the column went missing in the warehouse rather than being dropped here).
+            findings.append({"kind": "formula_broken_ref", "object": r.get("name"),
+                             "formula": _fml.strip(), "missing_ref": _ref.strip(),
+                             "ref_table": _rp[0] if len(_rp) > 1 else "",
+                             "ref_column": _rp[-1] if _rp else "", "error": msg.strip()})
+        _nc = _NO_COLS_SELECTED.search(msg)
+        if _nc:
+            matched = True
+            # Table names arrive as <li> items after the "following tables" preamble.
+            _tail = _clean(_nc.group(1))
+            _tbls = [ln.lstrip("- ").strip() for ln in _tail.split("\n")
+                     if ln.strip().startswith("- ") and ln.lstrip("- ").strip()]
+            findings.append({"kind": "model_table_no_columns", "object": r.get("name"),
+                             "model": r.get("name"), "tables": _tbls, "error": msg.strip()})
+        _mc = _MODEL_COL_BAD.search(msg)
+        if _mc:
+            matched = True
+            # Name the table::column pairs the message lists. These are SYMPTOMS — the reviewer
+            # resolves the table-level failure (realign or drop the column) and this clears itself.
+            # Deliberately no drop action of its own: dropping here would strip the model column
+            # even when the operator chose to REALIGN the underlying type and keep it.
+            refs = [(t.strip(), c.strip()) for t, c in _SCOPED_REF.findall(_clean(_mc.group(1)))
+                    if t.strip() and c.strip()]
+            for _t, _c in (refs or [(r.get("name"), "")]):
+                findings.append({"kind": "model_column_unresolved", "object": _t,
+                                 "column": _c, "model": r.get("name"), "error": msg.strip()})
+        if not matched and re.search(r"Error while translating .*? join|No matches found for table",
+                                     msg, re.I):
+            matched = True
+            # 14540: a model join can't resolve because a table/column it references was dropped
+            # (or is otherwise unavailable) — downstream of the missing-column drops. Name the
+            # table(s) whose join broke instead of dumping it into an anonymous "other"/unknown.
+            tbls = sorted({t.strip() for t in
+                           re.findall(r"translating\s+<b>[^<]*</b>\s+join of\s+<b>([^<]+)</b>",
+                                      msg, re.I) if t.strip()})
+            findings.append({"kind": "join_unresolved", "object": r.get("name"),
+                             "tables": tbls, "error": msg.strip()})
+        for _nm, _dbn in _TYPE_CHANGING.findall(msg):
+            matched = True
+            findings.append({"kind": "type_changed_notice", "object": r.get("name"),
+                             "column": _dbn.strip() or _nm.strip(),
+                             "logical_name": _nm.strip(), "error": msg.strip()})
+        for _bad, _nm, _dbn in _BAD_TYPE_TOKEN.findall(msg):
+            matched = True
+            # OUR bug shape, not the customer's: a raw warehouse type reached the TML where a TS
+            # token belongs. warehouse_type_to_ts exists to prevent exactly this.
+            findings.append({"kind": "invalid_type_token", "object": r.get("name"),
+                             "column": _dbn.strip() or _nm.strip(), "bad_type": _bad.strip(),
+                             "suggested": warehouse_type_to_ts(_bad.strip()),
+                             "error": msg.strip()})
+        _tm = _TABLES_MISSING.search(msg)
+        if _tm:
+            matched = True
+            _tbls = [b.strip() for b in _BOLD.findall(_tm.group(1)) if b.strip()]
+            findings.append({"kind": "table_missing_on_target", "object": r.get("name"),
+                             "tables": _tbls, "error": msg.strip()})
+        if _ZERO_COLUMNS.search(msg):
+            matched = True
+            # ThoughtSpot does not name the table; table_cleanup_findings() does, from the TML.
+            findings.append({"kind": "table_zero_columns", "object": r.get("name"),
+                             "error": msg.strip()})
+        _ip = _INVALID_COL_PROPS.search(msg)
+        if _ip:
+            matched = True
+            _body = _clean(_ip.group(1)).split("SOLUTION")[0]
+            _cols, _props = [], []
+            for _ln in (l.strip().lstrip("- ").strip() for l in _body.split("\n")):
+                _ln = _ln.strip("*").strip()
+                if not _ln:
+                    continue
+                if "::" in _ln:
+                    _cols.append(_ln)
+                else:
+                    _props.append(_ln)
+            findings.append({"kind": "invalid_column_property", "object": r.get("name"),
+                             "columns": _cols, "properties": sorted(set(_props)),
+                             "error": msg.strip()})
+        _az = _AUTHZ_OBJECTS.search(msg)
+        if _az:
+            matched = True
+            _by_type = _guids_by_type(_az.group(1))
+            findings.append({"kind": "target_permission_denied", "object": r.get("name"),
+                             "objects": _by_type,
+                             "guids": [g.strip() for v in _by_type.values()
+                                       for g in v.split(",") if g.strip()],
+                             "error": msg.strip()})
+        if not matched:
+            findings.append({"kind": "other", "object": r.get("name"), "error": msg.strip()})
+        for _f in findings[_start:]:
+            _f.setdefault("severity", _sev)
+    return findings
+
+
+def is_blocking_result(r):
+    """True when a VALIDATE_ONLY result must be resolved before import.
+
+    OK passes. WARNING is ThoughtSpot ACKNOWLEDGING something it accepted (a data type it changed,
+    say) — not work to do. Every place that splits results has to agree on this, or warnings leak
+    back in as errors through whichever path forgot: the per-file isolation pass did exactly that
+    and re-labelled them "ERROR", so two accepted realignments were counted as issues AND kept the
+    model isolation from ever running on the real failure."""
+    return (r.get("status") or "").upper() not in ("OK", "WARNING")
+
+
+def blocking(findings):
+    """Only the findings that must be resolved before import. A warning is information, not work."""
+    return [f for f in (findings or []) if f.get("severity", "error") != "warning"]
+
+
+def warnings_only(findings):
+    """The findings ThoughtSpot accepted but wants the operator to know about."""
+    return [f for f in (findings or []) if f.get("severity") == "warning"]
+
+
+def finding_key(f):
+    """Stable identity for a classified finding, for deduping the union across probe passes."""
+    k = f.get("kind")
+    obj = (f.get("object") or "").strip().lower()
+    if k in ("missing_in_target_warehouse", "type_mismatch"):
+        return (k, obj, (f.get("column") or "").strip().lower())
+    if k == "drop_blocked_by_dependents":
+        return (k, obj, tuple(sorted((c or "").lower() for c in f.get("columns", []))))
+    if k == "viz_error":
+        return (k, obj, tuple(sorted(str(v) for v in f.get("vizzes", []))))
+    if k == "invalid_formula_ids":
+        return (k, obj, tuple(sorted((x or "").lower() for x in f.get("formulas", []))))
+    if k == "model_column_unresolved":
+        return (k, obj, (f.get("column") or "").strip().lower())
+    if k == "formula_broken_ref":
+        return (k, (f.get("formula") or "").strip().lower(),
+                (f.get("missing_ref") or "").strip().lower())
+    if k == "model_table_no_columns":
+        return (k, obj, tuple(sorted((t or "").lower() for t in f.get("tables", []))))
+    if k in ("type_changed_notice", "invalid_type_token"):
+        return (k, obj, (f.get("column") or "").strip().lower())
+    if k == "table_missing_on_target":
+        return (k, obj, tuple(sorted((t or "").lower() for t in f.get("tables", []))))
+    if k == "invalid_column_property":
+        return (k, obj, tuple(sorted((c or "").lower() for c in f.get("columns", []))))
+    if k == "target_permission_denied":
+        return (k, obj, tuple(sorted((g or "").lower() for g in f.get("guids", []))))
+    if k == "dangling_ref":
+        return (k, obj, (f.get("name") or "").strip().lower())
+    if k == "drop_table":
+        return (k, (f.get("table") or "").strip().lower())
+    return (k, obj, (f.get("error") or "")[:200])
+
+
+def table_cleanup_findings(items):
+    """Tables that must be pruned WHOLE after column drops — the platform reports these only as
+    opaque failures the reviewer can't act on, so detect them statically:
+
+      empty        — the table has 0 columns left after drops. Import hard-fails "Attempting to
+                     create a table with 0 columns. Not allowed."
+      disconnected — a model table with no join path to the rest of the model (its join key was
+                     among the dropped columns), yet its columns are still surfaced. Import fails
+                     "No matches found for table ." during join translation.
+
+    Both resolve by dropping the whole table (drop_tables cascades its model_tables entry, joins,
+    surfaced columns, formulas and vizzes) AND removing the table's own TML from the set. Returns
+    findings kind 'drop_table' with a `reason`, deduped by table name (empty wins over
+    disconnected). A single-table model is never flagged as disconnected."""
+    empty, disconnected = {}, {}
+    for item in items:
+        try:
+            doc = _parse_edoc(item)
+        except Exception:
+            continue
+        t = doc.get("table")
+        if t and t.get("name") and t.get("columns") is not None and len(t["columns"]) == 0:
+            nm = t["name"]
+            empty[nm.lower()] = {"kind": "drop_table", "object": nm, "table": nm, "reason": "empty",
+                                 "error": (f"Table '{nm}' has no columns left after drops — it "
+                                           f"can't be created, so the whole table must be dropped.")}
+        for key in ("model", "worksheet"):
+            node = doc.get(key)
+            if not node:
+                continue
+            mts = node.get("model_tables") or []
+            if len(mts) <= 1:
+                continue   # single-table model — nothing to disconnect
+            has_out, targets = set(), set()
+            for mt in mts:
+                if mt.get("joins"):
+                    has_out.add((mt.get("name") or "").lower())
+                for j in mt.get("joins", []) or []:
+                    targets.add((j.get("with") or "").lower())
+            connected = has_out | targets
+            for mt in mts:
+                nm = mt.get("name") or ""
+                if nm and nm.lower() not in connected:
+                    disconnected[nm.lower()] = {
+                        "kind": "drop_table", "object": nm, "table": nm, "reason": "disconnected",
+                        "error": (f"Table '{nm}' lost its join(s) — its join key was dropped — so "
+                                  f"it's unreachable in the model. Drop the table, or restore the "
+                                  f"join-key column in the target warehouse to keep it.")}
+    out = list(empty.values())
+    out += [f for k, f in disconnected.items() if k not in empty]
+    return out
+
+
+def prune_tables_whole(items, table_names):
+    """Drop whole tables from a promotion, completely: clean every reference to them out of the
+    model(s) AND remove each table's own TML item from the set.
+
+    Both halves are required and neither is optional. drop_tables() alone cleans references but
+    leaves the table's own document in place, so an emptied table keeps being re-reported as a
+    hazard forever — a cleanup loop built on drop_tables() alone never reaches a fixed point.
+    That obligation used to live in the caller, where it is easy to forget; it lives here now so
+    a table drop is one operation with one contract. Returns (new_items, summary)."""
+    names = {(n or "").strip().lower() for n in table_names if n}
+    if not names:
+        return items, {"tables": 0, "columns": 0, "joins": 0, "formulas": 0, "vizzes": 0}
+    pruned, summary = drop_tables(items, table_names)
+    out = []
+    for it in pruned:
+        t = (_parse_edoc(it) or {}).get("table")
+        if t and (t.get("name") or "").strip().lower() in names:
+            continue
+        out.append(it)
+    return out, summary
+
+
+def model_tables_without_columns(items):
+    """Model tables still on the canvas with NONE of their columns surfaced — detected statically,
+    before the cluster is asked.
+
+    ThoughtSpot refuses a model in this state ("One or more tables have been added to the model
+    without selecting any of their columns … unintended cross joins"), and it is normally the tail
+    of a drop cascade: the last surfaced column of a bridge table gets dropped, the table stays on
+    the canvas, and the model fails on the NEXT validate. Catching it here means the operator sees
+    it with the drop that caused it.
+
+    Deliberately NOT returned as 'drop_table' (which the discovery loop auto-prunes). Removing a
+    bridge table silently changes the join graph and therefore the numbers — the very failure mode
+    the platform is warning about — so this is surfaced for a decision: restore a column, or remove
+    the table. Returns findings kind 'model_table_no_columns' with tables[] per model."""
+    out = []
+    for item in items:
+        try:
+            doc = _parse_edoc(item)
+        except Exception:
+            continue
+        for key in ("model", "worksheet"):
+            node = doc.get(key)
+            if not node:
+                continue
+            mts = node.get("model_tables") or []
+            if not mts:
+                continue
+            # Which tables does the model actually surface a column (or formula) from?
+            used = set()
+            for c in node.get("columns") or []:
+                cid = (c.get("column_id") or "").strip().lower()
+                if "::" in cid:
+                    used.add(cid.split("::")[0].strip())
+            for expr in _iter_strings(node.get("formulas") or []):
+                for inner in _BRACKET_REF.findall(expr):
+                    if "::" in inner:
+                        used.add(inner.split("::")[0].strip().lower())
+            bare = []
+            for mt in mts:
+                nm = (mt.get("name") or "").strip()
+                # A model table may be aliased on the canvas; the alias is what column_ids use.
+                alias = (mt.get("alias") or nm).strip()
+                if nm and alias.lower() not in used and nm.lower() not in used:
+                    bare.append(nm)
+            if bare:
+                out.append({"kind": "model_table_no_columns",
+                            "object": node.get("name") or doc.get("name"),
+                            "model": node.get("name"), "tables": sorted(bare),
+                            "error": ("Model table(s) " + ", ".join(bare) + " are on the canvas "
+                                      "with none of their columns selected. ThoughtSpot rejects "
+                                      "this (risk of unintended cross joins between facts): keep "
+                                      "at least one column, or remove the table from the model.")})
+    return out
+
+
+def dangling_reference_findings(items):
+    """Static, HIGH-PRECISION scan for `[formula_<Name>]` references that resolve to no formula in
+    the same model.
+
+    This is the class of break ThoughtSpot reports ONLY as an opaque, unnamed "Schema validation
+    failed" — e.g. a formula that references another formula which was dropped (as invalid), so the
+    referrer now dangles. The platform never names it, so we detect it ourselves and drop the
+    referrer (cascading its dependents).
+
+    Deliberately CONSERVATIVE: only the unambiguous `formula_` id form is checked. Bare `[Display]`
+    and `[table::col]` references are NOT flagged — they can resolve to parameters, model columns,
+    or physical columns we don't fully enumerate here, and a false positive would wrongly drop a
+    valid object. Returns findings of kind 'dangling_ref' naming the referrer to drop.
+    """
+    out = []
+    for item in items:
+        try:
+            doc = _parse_edoc(item)
+        except Exception:
+            continue
+        for key in ("model", "worksheet"):
+            node = doc.get(key)
+            if not node:
+                continue
+            mname = node.get("name") or ""
+            forms = node.get("formulas") or []
+            # Every way a formula can be addressed: its explicit id, and the `formula_<name>` form.
+            known = set()
+            for f in forms:
+                fid = (f.get("id") or "").strip().lower()
+                nm = (f.get("name") or "").strip().lower()
+                if fid:
+                    known.add(fid)
+                if nm:
+                    known.add("formula_" + nm)
+            def _missing(expr):
+                miss = []
+                for inner in _BRACKET_REF.findall(expr or ""):
+                    w = inner.strip().lower()
+                    if w.startswith("formula_") and w not in known:
+                        miss.append(inner.strip())
+                return sorted(set(miss))
+            # (a) a formula whose expression references a formula that no longer exists
+            for f in forms:
+                miss = _missing(f.get("expr", ""))
+                if miss:
+                    out.append({"kind": "dangling_ref", "object": mname,
+                                "name": f.get("name", "?"), "ref_type": "formula",
+                                "missing": miss,
+                                "error": (f"Formula '{f.get('name','?')}' references "
+                                          f"{', '.join(miss)} — which no longer exists in the "
+                                          f"model. It would fail import as an opaque 'Schema "
+                                          f"validation failed'. Dropping it (and anything that "
+                                          f"depends on it) resolves it.")})
+            # (b) a column whose formula id points at a formula that no longer exists
+            for c in node.get("columns", []) or []:
+                w = (c.get("formula_id") or c.get("column_id") or "").strip().lower()
+                if w.startswith("formula_") and w not in known:
+                    out.append({"kind": "dangling_ref", "object": mname,
+                                "name": c.get("name", "?"), "ref_type": "column",
+                                "missing": [w],
+                                "error": (f"Column '{c.get('name','?')}' surfaces {w} — a formula "
+                                          f"that no longer exists. Dropping the column resolves it.")})
+    return out
+
+
+def warehouse_missing_findings(items, cdw_map, fallback_map=None, connection=""):
+    """Enumerate EVERY promoted table column absent from the target warehouse, UP FRONT.
+
+    ThoughtSpot's VALIDATE_ONLY stops at the FIRST missing column per table, so relying on it
+    surfaces missing columns one-per-round (whack-a-mole). We diff each table's columns against the
+    warehouse's own column set and return the whole set at once.
+
+    Source of truth is the TARGET CONNECTION (the CDW). `cdw_map` is that authoritative set,
+    read straight from the warehouse via connection/search:
+        {table_name.lower(): {db_column_name.lower(): actual_db_column_name}}.
+    A column absent from `cdw_map` genuinely does not exist in the warehouse (this is what import
+    error 14536 reports) → finding marked `verified=True`, no caveat.
+
+    `fallback_map` (optional) is the target org's already-MODELED logical-table columns — used ONLY
+    for a table the connection could not introspect (warehouse unreachable / timed out). The org's
+    modeled set can be a SUBSET of the warehouse, so a column present in the CDW but not modeled
+    there would look missing. Findings from the fallback are marked `verified=False` + a caveat, so
+    the UI can flag them as unconfirmed rather than a hard warehouse error.
+
+    Returns findings in the same shape as classify_import_errors' 'missing_in_target_warehouse',
+    plus a `verified` flag. A table in neither map is skipped (nothing to assert against).
+    """
+    cdw_map = cdw_map or {}
+    fallback_map = fallback_map or {}
+    findings = []
+    for item in items:
+        try:
+            doc = _parse_edoc(item)
+        except Exception:  # malformed edoc — skip, don't crash the diff
+            continue
+        t = (doc or {}).get("table")
+        if not t or not t.get("name"):
+            continue
+        key = t["name"].strip().lower()
+        wh = cdw_map.get(key)
+        verified = wh is not None
+        if wh is None:
+            wh = fallback_map.get(key)
+        if not wh:
+            continue  # warehouse couldn't be read and no fallback -> cannot assert anything
+        for c in t.get("columns", []) or []:
+            dbn = (c.get("db_column_name") or c.get("name") or "").strip()
+            if not dbn or dbn.lower() in wh:
+                continue
+            db, sch = t.get("db", ""), t.get("schema", "")
+            phys = t.get("db_table") or t.get("name")
+            f = {
+                "kind": "missing_in_target_warehouse",
+                "object": t["name"],
+                "column": dbn,
+                "column_fqn": ".".join(x for x in (db, sch, phys, dbn) if x),
+                "connection": (t.get("connection") or {}).get("name") or connection,
+                "verified": verified,
+            }
+            if not verified:
+                f["caveat"] = ("could not read the warehouse for this table — based on the target's "
+                               "modeled columns, so a column that exists in the warehouse but isn't "
+                               "modeled could show here. Verify before dropping.")
+            findings.append(f)
+    return findings
+
+
+def silent_drop_findings(source_table_docs, target_docs_by_name):
+    """Pre-import safety net for the SILENT target-extra case the platform never reports.
+
+    source_table_docs   : table TML dicts being promoted.
+    target_docs_by_name : {table_name: target's current table TML dict}, for tables that
+                          already exist on the target.
+
+    Returns [{table, columns}] where columns exist on the target but are absent from the
+    source TML — i.e. they would be dropped on import, silently when they have no
+    dependents (with dependents the import errors instead — caught at validation).
+    """
+    out = []
+    for d in source_table_docs:
+        t = d.get("table")
+        if not t:
+            continue
+        tgt = target_docs_by_name.get(t.get("name"))
+        if not tgt:
+            continue   # not on target yet -> created fresh, nothing dropped
+        # Case-EXACT compare: a target column that differs from the source only by case is a real
+        # column that would be dropped, so it must be flagged (not folded away by the matcher's
+        # case-insensitive signature).
+        diff = compare_columns(column_signature(d, casefold=False),
+                               column_signature(tgt, casefold=False))
+        if diff["extra_on_target"]:
+            out.append({"table": t.get("name"), "columns": diff["extra_on_target"]})
+    return out
+
+
+def _col_name(model_col):
+    cid = model_col.get("column_id", "") or ""
+    return (cid.split("::")[-1] if "::" in cid else model_col.get("name", "") or "").lower()
+
+
+_BRACKET_REF = re.compile(r"\[([^\]]+)\]")
+
+
+def _parse_edoc(item):
+    edoc = item.get("edoc", "{}")
+    if not isinstance(edoc, str):
+        return edoc
+    return json.loads(edoc) if edoc.strip().startswith("{") else _yaml_load(edoc)
+
+
+def _yaml_load(s):
+    import yaml
+    return yaml.safe_load(s)
+
+
+def _iter_strings(obj):
+    """Yield every string anywhere in a nested structure. The join condition key `on`
+    parses as the boolean True in YAML 1.1, so we can't rely on key names — scan values."""
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            yield from _iter_strings(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _iter_strings(v)
+
+
+def _expr_refs(obj, targets, display_targets):
+    """True if any `[table::Col]` / `[Display Name]` / `[formula_<Name>]` reference inside obj hits
+    a target. Formula-to-formula refs carry a `formula_` id prefix, so also match after stripping
+    it (see _refs_any)."""
+    for expr in _iter_strings(obj):
+        for inner in _BRACKET_REF.findall(expr):
+            tail = inner.split("::")[-1].strip().lower()
+            whole = inner.strip().lower()
+            if tail in targets or whole in display_targets:
+                return True
+            for cand in (tail, whole):
+                if cand.startswith("formula_") and (cand[len("formula_"):] in targets
+                                                     or cand[len("formula_"):] in display_targets):
+                    return True
+    return False
+
+
+def _resolve_display_names(docs, targets):
+    """Display names of model/worksheet columns whose physical name is in `targets`, so leaf
+    answers/liveboards (which reference the column by its model display name) can be matched."""
+    disp = set()
+    for doc in docs:
+        for key in ("model", "worksheet"):
+            node = doc.get(key)
+            if not node:
+                continue
+            for c in node.get("columns", []) or []:
+                if _col_name(c) in targets:
+                    nm = (c.get("name") or "").strip().lower()
+                    if nm:
+                        disp.add(nm)
+    return disp
+
+
+def column_usage(items, column):
+    """Column-PRECISE attribution: which objects in `items` actually reference `column`,
+    and where. `items` should include the model(s) so leaf answers/liveboards resolve the
+    column's display name. Returns [{name, kind, where:[...]}], one entry per object that
+    references it (objects that only touch the table via OTHER columns are excluded)."""
+    targets = {column.lower()}
+    docs = [_parse_edoc(it) for it in items]
+    display_targets = _resolve_display_names(docs, targets)
+    match_set = targets | display_targets
+
+    out = []
+    for doc in docs:
+        where = []
+        # model / worksheet: the column itself, joins, formulas
+        for key in ("model", "worksheet"):
+            node = doc.get(key)
+            if not node:
+                continue
+            if any(_col_name(c) in targets for c in node.get("columns", []) or []):
+                where.append("column")
+            for mt in (node.get("model_tables") or node.get("tables") or []):
+                for j in mt.get("joins", []) or []:
+                    if _expr_refs(j, targets, display_targets):
+                        where.append(f"join {mt.get('name','')}->{j.get('with','')}".strip())
+            for fdef in node.get("formulas", []) or []:
+                if _expr_refs(fdef, targets, display_targets):
+                    where.append(f"formula:{fdef.get('name','?')}")
+        # liveboard: which vizzes reference it
+        lb = doc.get("liveboard")
+        if lb:
+            for viz in lb.get("visualizations", []) or []:
+                ac = [(c.get("name", "") or "").strip().lower()
+                      for c in viz.get("answer", {}).get("answer_columns", [])]
+                if any(a in match_set for a in ac) or _expr_refs(viz, targets, display_targets):
+                    where.append(f"viz:{viz.get('id') or viz.get('viz_id') or 'viz'}")
+        # saved answer
+        ans = doc.get("answer")
+        if ans:
+            ac = [(c.get("name", "") or "").strip().lower() for c in ans.get("answer_columns", [])]
+            if any(a in match_set for a in ac) or _expr_refs(ans, targets, display_targets):
+                where.append("uses column")
+
+        if where:
+            typ = next((k for k in ("liveboard", "answer", "model", "worksheet", "table") if k in doc), "object")
+            name = (doc.get(typ) or {}).get("name", "") if isinstance(doc.get(typ), dict) else ""
+            seen, w = set(), []
+            for x in where:
+                if x not in seen:
+                    seen.add(x)
+                    w.append(x)
+            out.append({"name": name or "(unnamed)", "kind": typ, "where": w})
+    return out
+
+
+def column_dependents(items, columns):
+    """Read-only preview of what references the given columns across the promotion set,
+    so a reviewer sees the blast radius BEFORE choosing to drop. columns are matched on
+    the physical column name (column_id last segment) and the resolved model display name.
+
+    Returns {model_columns, joins, formulas, vizzes}. Joins and formulas reference columns
+    by `[table::Col]` / `[Display Name]`, so dropping a column they use leaves a dangling
+    reference -> the drop path must treat those as manual-cleanup, not auto-removable.
+    """
+    targets = {c.lower() for c in columns}
+    docs = [_parse_edoc(item) for item in items]
+    display_targets = _resolve_display_names(docs, targets)
+    match_set = targets | display_targets
+
+    deps = {"model_columns": [], "joins": [], "formulas": [], "vizzes": []}
+    for doc in docs:
+        for key in ("model", "worksheet"):
+            node = doc.get(key)
+            if not node:
+                continue
+            for c in node.get("columns", []) or []:
+                if _col_name(c) in targets:
+                    deps["model_columns"].append(c.get("name") or _col_name(c))
+            for mt in (node.get("model_tables") or node.get("tables") or []):
+                for j in mt.get("joins", []) or []:
+                    if _expr_refs(j, targets, display_targets):
+                        deps["joins"].append(j.get("name") or f"{mt.get('name','')} -> {j.get('with','')}")
+            for f in node.get("formulas", []) or []:
+                if _expr_refs(f, targets, display_targets):
+                    deps["formulas"].append(f.get("name") or "(unnamed formula)")
+        lb = doc.get("liveboard")
+        if lb:
+            for viz in lb.get("visualizations", []) or []:
+                acols = [(c.get("name", "") or "").lower()
+                         for c in viz.get("answer", {}).get("answer_columns", [])]
+                if any(any(t in ac or ac in t for t in match_set) for ac in acols):
+                    deps["vizzes"].append(viz.get("id") or viz.get("viz_id") or "(viz)")
+        ans = doc.get("answer")
+        if ans:
+            acols = [(c.get("name", "") or "").lower() for c in ans.get("answer_columns", [])]
+            if any(any(t in ac or ac in t for t in match_set) for ac in acols):
+                deps["vizzes"].append(ans.get("name") or "(answer)")
+    for k in deps:
+        seen, out = set(), []
+        for v in deps[k]:
+            if v not in seen:
+                seen.add(v)
+                out.append(v)
+        deps[k] = out
+    return deps
+
+
+def _refs_any(obj, removed, removed_qual=None):
+    """True if any [table::Col] / [Display] / [Formula Name] / [formula_<Name>] reference inside
+    obj hits a target.
+
+    `removed` (bare names, lowercased) matches by NAME regardless of table — used for display
+    names, formula names, and bare-name column drops. `removed_qual` (set of (table, col), both
+    lowercased) matches ONLY a `[table::col]` reference to that exact table — so a warehouse-
+    missing column dropped from ONE table doesn't take out same-named columns on other tables.
+
+    Formula-to-formula refs carry the `formula_` id prefix — `[formula_Call Count]` vs the bare
+    name `call count` — so a ref also matches after stripping a leading `formula_`."""
+    removed_qual = removed_qual or set()
+    for expr in _iter_strings(obj):
+        for inner in _BRACKET_REF.findall(expr):
+            tail = inner.split("::")[-1].strip().lower()
+            head = inner.split("::")[0].strip().lower() if "::" in inner else None
+            if head is not None and (head, tail) in removed_qual:
+                return True
+            for cand in (tail, inner.strip().lower()):
+                if cand in removed:
+                    return True
+                if cand.startswith("formula_") and cand[len("formula_"):] in removed:
+                    return True
+    return False
+
+
+def _viz_refs(viz, removed, removed_qual=None):
+    """A liveboard viz references a removed name via its answer_columns or any inner expr."""
+    for c in viz.get("answer", {}).get("answer_columns", []) or []:
+        if (c.get("name", "") or "").strip().lower() in removed:
+            return True
+    return _refs_any(viz, removed, removed_qual)
+
+
+def drop_columns(items, columns):
+    """Remove the named columns from every model/table AND cascade-remove everything that
+    depended on them — joins and formulas whose expression references a dropped column, then
+    (transitively) any formula/viz that referenced THOSE formulas, and any liveboard viz that
+    references a removed column/formula. Layout tiles for removed vizzes are pruned too.
+
+    columns may be a bare name (display or db_column_name — matched across ALL tables) OR a
+    qualified `table::col` (matched ONLY on that table, so a warehouse-missing column dropped from
+    one table doesn't take same-named columns off other tables).
+    Returns (new_items, manifest) where manifest = {columns, joins, formulas:[names], vizzes}.
+    """
+    # Split targets: bare names vs table-qualified (table, col).
+    targets = set()          # bare column names (lowercased)
+    removed_qual = set()     # (table_lower, col_lower) — scoped to that table only
+    for c in columns:
+        cl = (c or "").strip().lower()
+        if "::" in cl:
+            tbl, col = cl.split("::", 1)
+            removed_qual.add((tbl.strip(), col.strip()))
+        else:
+            targets.add(cl)
+    # A column dropped by physical name is referenced downstream by its model DISPLAY name, so
+    # seed the "removed reference names" with both. (Qualified drops seed their display name when
+    # the surfacing model column is removed, inside the fixpoint loop.)
+    all_docs = [_parse_edoc(it) for it in items]
+    removed = set(targets) | _resolve_display_names(all_docs, targets)
+
+    man = {"columns": 0, "joins": 0, "formulas": [], "vizzes": 0,
+           "column_names": [], "join_names": []}   # names: so a drop can be itemized, not just counted
+    out = []
+    for item, doc in zip(items, all_docs):
+        for key in ("model", "worksheet"):
+            node = doc.get(key)
+            if not node:
+                continue
+            # Formulas AND the columns that surface them cascade together to a fixpoint:
+            #  - a formula referencing a removed name is removed (its name joins `removed`),
+            #  - a model column whose column_id is `formula_<name>` for a removed formula is ALSO
+            #    removed — otherwise it dangles as an "invalid formula ID" on import,
+            #  - removing that column can in turn orphan another formula, so we re-scan.
+            changed = True
+            while changed:
+                changed = False
+                if node.get("formulas"):
+                    keep = []
+                    for fdef in node["formulas"]:
+                        nm = (fdef.get("name", "") or "").strip().lower()
+                        # Remove a formula if it references a removed column OR is itself a target
+                        # (so dropping an invalid/orphaned formula by name works and takes its
+                        # surfacing `formula_<name>` column with it).
+                        if _refs_any(fdef, removed, removed_qual) or nm in removed:
+                            man["formulas"].append(fdef.get("name", "?"))
+                            if nm and nm not in removed:
+                                removed.add(nm); changed = True
+                        else:
+                            keep.append(fdef)
+                    node["formulas"] = keep
+                if node.get("columns") is not None:
+                    keep = []
+                    for c in node["columns"]:
+                        cid = (c.get("column_id", "") or "").strip().lower()
+                        dn  = (c.get("name", "") or "").strip().lower()
+                        # A formula-surfacing column may carry column_id `formula_<name>` OR no
+                        # column_id at all (linked to its formula purely by NAME). Either way, once
+                        # the formula is removed the column must go too, or it dangles as an
+                        # "invalid formula ID" on import. So also drop a column whose NAME matches a
+                        # removed formula/column.
+                        surfaces_removed_formula = (
+                            cid.startswith("formula_") and cid[len("formula_"):] in removed)
+                        # qualified: model column_id is `table::col` — drop only if THAT table's
+                        # column is targeted (not a same-named column on another table).
+                        _qual_hit = ("::" in cid
+                                     and (cid.split("::")[0], cid.split("::")[-1]) in removed_qual)
+                        # A PHYSICAL, table-backed model column (column_id `table::col`) may drop ONLY
+                        # via a bare `targets` hit or its own `_qual_hit` — NOT via `dn in removed`.
+                        # `removed` accumulates the display name of every dropped column for the leaf/
+                        # formula cascade; for a shared name like ACCT_ID that bare match would drop the
+                        # same-named column off a DIFFERENT table/model (whose own column wasn't
+                        # targeted). Only formula/derived columns (no physical `table::col` id) use the
+                        # bare display-name cascade.
+                        _is_physical = ("::" in cid and not cid.startswith("formula_"))
+                        if (_col_name(c) in targets or surfaces_removed_formula or _qual_hit
+                                or (dn in removed and not _is_physical)):
+                            man["columns"] += 1
+                            man["column_names"].append(c.get("name") or _col_name(c))
+                            if dn and dn not in removed:
+                                removed.add(dn); changed = True   # re-scan: vizzes/formulas on it
+                        else:
+                            keep.append(c)
+                    node["columns"] = keep
+            # Joins whose `on` condition references a removed COLUMN. A join's `on` is written with
+            # table-qualified physical refs ([table::COL]), never model display names — so match it
+            # ONLY against the explicit bare drops (`targets`) and the qualified set (`removed_qual`),
+            # NOT the accumulated `removed`. `removed` picks up the DISPLAY NAME of every dropped
+            # column (for the leaf/viz cascade); for a shared join key like ACCT_ID that bare name would
+            # otherwise match [otherTable::ACCT_ID] on EVERY table and wrongly sever every ACCT_ID join
+            # from a single scoped drop — disconnecting the model.
+            for mt in (node.get("model_tables") or node.get("tables") or []):
+                if mt.get("joins"):
+                    _kept_j = [j for j in mt["joins"] if not _refs_any(j, targets, removed_qual)]
+                    for j in mt["joins"]:
+                        if j not in _kept_j:
+                            man["join_names"].append(
+                                j.get("name") or f"{mt.get('name','')} -> {j.get('with','')}")
+                    man["joins"] += len(mt["joins"]) - len(_kept_j)
+                    mt["joins"] = _kept_j
+
+        t = doc.get("table")
+        if t and t.get("columns") is not None:
+            _tl = (t.get("name", "") or "").strip().lower()
+            def _drop_phys(c):
+                nm = (c.get("name", "") or "").lower()
+                dbn = (c.get("db_column_name", "") or "").lower()
+                if nm in targets or dbn in targets:
+                    return True   # bare name — any table
+                return (_tl, nm) in removed_qual or (_tl, dbn) in removed_qual   # qualified — this table
+            _keep_t = [c for c in t["columns"] if not _drop_phys(c)]
+            for c in t["columns"]:
+                if c not in _keep_t:
+                    man["column_names"].append(f"{t.get('name','')}.{c.get('name') or c.get('db_column_name','')}")
+            man["columns"] += len(t["columns"]) - len(_keep_t)
+            t["columns"] = _keep_t
+
+        lb = doc.get("liveboard")
+        if lb and lb.get("visualizations") is not None:
+            kept, kept_ids = [], set()
+            for viz in lb["visualizations"]:
+                if _viz_refs(viz, removed, removed_qual):
+                    man["vizzes"] += 1
+                else:
+                    kept.append(viz)
+                    kept_ids.add(str(viz.get("id") or viz.get("viz_id") or ""))
+            lb["visualizations"] = kept
+            layout = lb.get("layout") or {}
+
+            def _prune(tiles):
+                return [ti for ti in tiles if str(ti.get("visualization_id", "")) in kept_ids]
+            if isinstance(layout.get("tiles"), list):
+                layout["tiles"] = _prune(layout["tiles"])
+            if isinstance(layout.get("tabs"), list):
+                for tab in layout["tabs"]:
+                    if isinstance(tab.get("tiles"), list):
+                        tab["tiles"] = _prune(tab["tiles"])
+
+        out.append({**item, "edoc": json.dumps(doc)})
+    return out, man
+
+
+def column_drop_cascade(items, columns):
+    """Dry-run: what drop_columns(items, columns) WOULD remove, for a pre-confirm preview.
+    Returns the same manifest dict without mutating anything."""
+    import copy
+    _clone = [{**it, "edoc": json.dumps(_parse_edoc(it))} for it in items]
+    _out, man = drop_columns(_clone, columns)
+    return man
+
+
+_WH_TO_TS_TYPE = {
+    "boolean": "BOOL", "bool": "BOOL",
+    # 32-bit ints map to INT32 (the TML uses INT32 for these); only 64-bit -> INT64.
+    "tinyint": "INT32", "smallint": "INT32", "int": "INT32", "integer": "INT32",
+    "bigint": "INT64", "long": "INT64",
+    "float": "FLOAT", "double": "DOUBLE", "real": "DOUBLE",
+    "string": "VARCHAR", "text": "VARCHAR",
+    "date": "DATE",
+    "timestamp": "DATE_TIME", "timestamp_ntz": "DATE_TIME", "datetime": "DATE_TIME",
+    # TS TOKENS round-trip to themselves. Not every type source hands back a raw warehouse string:
+    # the connection/search COLUMN path reports the connection's own token (the customer's ACCOUNT_AGE reads
+    # as INT64, not bigint) and the modeled fallback reads TML data_type. Without these the mapping
+    # returns "" for those sources, and a caller that compares tokens would silently stop flagging.
+    "int32": "INT32", "int64": "INT64", "int16": "INT32", "date_time": "DATE_TIME",
+}
+
+# Coarse type FAMILY. Kept for VOID detection and for describing a mismatch ("string vs number");
+# it is NOT the flagging rule. Flagging compares TS TOKENS (see warehouse_type_findings): within
+# one family a mismatch can still hard-fail — DOUBLE vs bigint are both "num" and ThoughtSpot
+# rejects it. Covers both warehouse strings (bigint, string, …) and TS tokens (INT32, VARCHAR, …).
+_TYPE_FAMILY = {
+    "tinyint": "num", "smallint": "num", "int": "num", "integer": "num", "bigint": "num",
+    "long": "num", "float": "num", "double": "num", "real": "num", "decimal": "num", "numeric": "num",
+    "int16": "num", "int32": "num", "int64": "num",
+    "string": "str", "varchar": "str", "char": "str", "text": "str",
+    "boolean": "bool", "bool": "bool",
+    "date": "date", "timestamp": "date", "timestamp_ntz": "date", "datetime": "date",
+    "date_time": "date", "time": "date",
+}
+
+
+# Storage CLASS — the granularity at which ThoughtSpot actually rejects a type.
+#
+# Evidence, from every hard 14536 in ~2 months of real customer runs: BOOL vs non-bool,
+# VARCHAR vs number (x5), and DOUBLE vs INT64 (ACCOUNT_AGE). Not one failure was an INTEGER WIDTH
+# difference — int vs bigint, INT32 vs INT64 — in any run.
+#
+# So family (num/str/bool/date) is too coarse: it lumps DOUBLE in with INT64 and stayed silent on a
+# real hard failure. And the exact TS token is too fine: it splits INT32 from INT64 and demands a
+# realignment the platform never asked for, which rewrites the customer's TML for no benefit and
+# earns a "DataType is being changed ... may break the dependents" warning for the trouble.
+# Integer-vs-floating-point is the line that matters; integer width is not.
+_TYPE_CLASS = {
+    "tinyint": "int", "smallint": "int", "int": "int", "integer": "int", "bigint": "int",
+    "long": "int", "int16": "int", "int32": "int", "int64": "int",
+    "float": "float", "double": "float", "real": "float", "decimal": "float", "numeric": "float",
+    "string": "str", "varchar": "str", "char": "str", "text": "str",
+    "boolean": "bool", "bool": "bool",
+    "date": "date", "timestamp": "date", "timestamp_ntz": "date", "datetime": "date",
+    "date_time": "date", "time": "date",
+}
+
+
+def type_class(t):
+    """Storage class of a warehouse type OR a TS token: int / float / str / bool / date / void.
+    "" when unknown. Precision is stripped, so decimal(10,2) -> decimal -> float."""
+    t = (t or "").strip().lower()
+    if not t:
+        return ""
+    if t == "void":
+        return "void"
+    return _TYPE_CLASS.get(t.split("(")[0].strip(), "")
+
+
+def type_family(t):
+    """Coarse family (num/str/bool/date/void) for a warehouse type OR a TS token; "" if unknown.
+    Precision is stripped, so decimal(10,2) -> decimal -> num and varchar(255) -> varchar -> str."""
+    t = (t or "").strip().lower()
+    if not t:
+        return ""
+    if t == "void":
+        return "void"
+    return _TYPE_FAMILY.get(t.split("(")[0].strip(), "")
+
+
+def warehouse_type_to_ts(wh_type):
+    """Map a warehouse (Databricks) physical type to the ThoughtSpot TML `data_type` TOKEN that
+    represents it (int -> INT32, bigint -> INT64, string -> VARCHAR, …). TML data_type is a TS enum,
+    NOT the raw warehouse string — writing 'bigint' is rejected ('Data type bigint is not valid').
+    Returns "" for anything we can't confidently map (e.g. Databricks 'void') so the caller offers no
+    realign there. Tokens: INT32/INT64/DOUBLE/FLOAT/VARCHAR/BOOL/DATE/DATE_TIME."""
+    t = (wh_type or "").strip().lower()
+    if not t:
+        return ""
+    if t.startswith(("decimal", "numeric")):
+        return "DOUBLE"
+    if t.startswith(("varchar", "char")):
+        return "VARCHAR"
+    return _WH_TO_TS_TYPE.get(t, "")
+
+
+def warehouse_type_findings(items, type_map, connection=""):
+    """ONE-PASS type diff: every promoted column whose TML `data_type` disagrees with the warehouse's
+    physical type, surfaced all at once instead of relying on VALIDATE_ONLY's one-per-round 14536
+    (the type whack-a-mole). `type_map` = {table_lower: {col_lower: warehouse_type_string}} (e.g. from
+    hive DESCRIBE). Returns type_mismatch findings in the same shape as classify_import_errors.
+
+    Flags a column when the warehouse type and the TML token disagree once the warehouse type is
+    normalised to the TS TOKEN it maps to (bigint -> INT64, int -> INT32, string -> VARCHAR), or
+    when the warehouse type is VOID (unusable). An unknown/unmappable type on either side, or a
+    column absent from the map, is skipped.
+
+    Compare on the TOKEN, not the coarse FAMILY. Family compare was too loose: DOUBLE vs bigint
+    are both "num", so it stayed silent on a real hard failure — Customer run 2026-09-11, ACCOUNT_AGE:
+    "DataType DOUBLE does not match CDW DataType ... fact_regional_account_bridge_east_br.
+    ACCOUNT_AGE", which killed the table and cascaded into the model that used it, while the drift
+    table rendered EMPTY. Token compare still absorbs the false positive family compare was added
+    for: Databricks `int` and TML `INT32` both normalise to INT32, so INT-vs-INT32 stays quiet."""
+    out = []
+    for item in items:
+        try:
+            doc = _parse_edoc(item)
+        except Exception:
+            continue
+        t = (doc or {}).get("table")
+        if not t or not t.get("name"):
+            continue
+        wh = type_map.get(t["name"].strip().lower())
+        if not wh:
+            continue
+        db, sch = t.get("db", ""), t.get("schema", "")
+        phys = t.get("db_table") or t.get("name")
+        for c in t.get("columns", []) or []:
+            dbn = (c.get("db_column_name") or c.get("name") or "").strip()
+            if not dbn:
+                continue
+            cdw_t = wh.get(dbn.lower())
+            if cdw_t is None:
+                continue   # not in the warehouse -> MISSING, not a type mismatch
+            tml_t = ((c.get("db_column_properties") or {}).get("data_type") or "").strip()
+            # Compare storage CLASS: int vs float vs str vs bool vs date. An unknown type on
+            # either side is never flagged (we only report drift we can explain), and an integer
+            # width difference is NOT drift — the platform accepts it.
+            _cc, _tc = type_class(cdw_t), type_class(tml_t)
+            _flag = _cc == "void" or bool(_cc and _tc and _cc != _tc)
+            if _flag:
+                out.append({
+                    "kind": "type_mismatch",
+                    "object": t["name"],
+                    "column": dbn,
+                    "column_fqn": ".".join(x for x in (db, sch, phys, dbn) if x),
+                    "source_type": tml_t,
+                    "connection": (t.get("connection") or {}).get("name") or connection,
+                })
+    return out
+
+
+def realign_column_types(items, realign):
+    """Approve-first TYPE realignment: set a column's declared data_type to a new value so it
+    matches the CDW (fixing a 14536 DataType mismatch), instead of dropping the column. This is
+    a deliberate, user-approved change — never automatic.
+
+    `realign`: {"table::col": new_type} — ALWAYS table-qualified (scoped to that one table, so a
+    shared column name isn't retyped everywhere). The type is written to the TABLE column's
+    `db_column_properties.data_type` (where column_signature and TS's 14536 check read it); the
+    caller re-validates afterward, which is the source of truth on whether the new type satisfied
+    the warehouse.
+
+    SELF-CORRECTING: a realignment is applied only when it actually changes the storage CLASS
+    (int / float / str / bool / date). An approval is durable — it is re-applied to every export
+    from then on — so an approval collected under an older, stricter rule would keep rewriting the
+    TML forever. Retyping INT64 to INT32 buys nothing the platform cares about and costs a
+    "DataType is being changed ... may break the dependents" warning, so it is skipped here rather
+    than relying on someone remembering to clear it. VARCHAR to INT64 still applies.
+
+    Returns (new_items, count_changed)."""
+    want = {}   # (table_lower, col_lower) -> new_type
+    for k, v in (realign or {}).items():
+        if "::" in (k or "") and v:
+            _t, _c = k.split("::", 1)
+            want[(_t.strip().lower(), _c.strip().lower())] = v
+    if not want:
+        return items, 0
+    out, n = [], 0
+    for item in items:
+        doc = _parse_edoc(item)
+        t = doc.get("table")
+        if t and t.get("columns"):
+            _tl = (t.get("name", "") or "").strip().lower()
+            for c in t["columns"]:
+                nm  = (c.get("name", "") or "").strip().lower()
+                dbn = (c.get("db_column_name", "") or "").strip().lower()
+                new_t = want.get((_tl, nm)) or want.get((_tl, dbn))
+                if new_t:
+                    cur_t = (c.get("db_column_properties") or {}).get("data_type") or ""
+                    # No class change => nothing the platform needs => leave the TML alone.
+                    if type_class(cur_t) and type_class(cur_t) == type_class(new_t):
+                        continue
+                    c.setdefault("db_column_properties", {})["data_type"] = new_t
+                    n += 1
+        out.append({**item, "edoc": json.dumps(doc)})
+    return out, n
+
+
+def drop_column_properties(items, targets):
+    """Remove named PROPERTIES from model/worksheet columns, keeping the columns themselves.
+
+    `targets`: {"table::col": ["calendar", …]} — scoped, and the property names are matched
+    case-insensitively. This is the answer to "Model/Worksheet columns have invalid properties":
+    the target rejects the property name, so the property goes and the column stays with its data,
+    its name and its obj_id intact. Approve-first, like a realign — never applied automatically,
+    because the property means something on the source and dropping it is a real (if small)
+    semantic change to what lands.
+
+    Returns (new_items, [(column, property), …] actually removed)."""
+    want = {}
+    for k, props in (targets or {}).items():
+        if "::" in (k or "") and props:
+            want[k.strip().lower()] = {str(p).strip().lower() for p in props}
+    if not want:
+        return items, []
+    removed, out = [], []
+    for item in items:
+        doc = _parse_edoc(item)
+        touched = False
+        for key in ("model", "worksheet"):
+            node = doc.get(key)
+            if not node:
+                continue
+            for c in node.get("columns") or []:
+                cid = (c.get("column_id") or "").strip().lower()
+                props = want.get(cid)
+                if not props:
+                    continue
+                for pname in [p for p in list(c.keys()) if p.strip().lower() in props]:
+                    c.pop(pname, None)
+                    removed.append((c.get("column_id"), pname))
+                    touched = True
+                # some builds nest them under `properties`
+                nested = c.get("properties")
+                if isinstance(nested, dict):
+                    for pname in [p for p in list(nested.keys()) if p.strip().lower() in props]:
+                        nested.pop(pname, None)
+                        removed.append((c.get("column_id"), pname))
+                        touched = True
+        out.append({**item, "edoc": json.dumps(doc)} if touched else item)
+    return out, removed
+
+
+def scan_names_for_drops(drop_set, cascade_names=None):
+    """Every spelling a dependent might use to refer to a dropped column.
+
+    The drop set is keyed `table::PHYSICAL_COL`, while an answer refers to the column by its
+    DISPLAY name, and the cascade log records physical columns dotted (`table.COL`) and model /
+    formula columns bare. Miss a spelling and the dependency scan quietly reports nothing, which
+    is the most dangerous possible failure here — it would read as "safe to drop".
+
+    Returns a lowercased set of bare names to match against."""
+    out = set()
+    for s in (drop_set or ()):
+        s = (s or "").strip()
+        if not s:
+            continue
+        out.add(s.lower())
+        out.add(s.split("::")[-1].strip().lower())
+    for s in (cascade_names or ()):
+        s = (s or "").strip()
+        if not s:
+            continue
+        out.add(s.lower())
+        out.add(s.split(".")[-1].strip().lower())
+        out.add(s.split("::")[-1].strip().lower())
+    return {s for s in out if s}
+
+
+def strip_vizzes_from_tml(edoc, viz_ids):
+    """Remove named visualisations from ONE exported liveboard TML, layout tile and all.
+
+    This used to keep the orphaned layout tile on purpose, so the board's owner would see a hole
+    where something was taken out. It does not work: ThoughtSpot accepts the orphan at import and
+    then DISCARDS it, and the board comes back closed up with no gap (verified against a real
+    board on a live test cluster 2026-09-23). So the tile goes, the board reflows, and the owners are told
+    out of band instead. A visible marker would need a real placeholder visualisation, which is a
+    bigger and more intrusive thing than anyone asked for.
+
+    Returns (new_edoc, removed, remaining). `remaining` is how many tiles the board still has, so
+    the caller can refuse to leave an empty liveboard behind rather than discovering it after the
+    write. Raises nothing: an edoc that is not a liveboard comes back unchanged with removed=0.
+
+    An ANSWER has no tiles to strip — it IS a single visualisation — so removing its column means
+    deleting the answer. Only a liveboard gets this surgical treatment.
+    """
+    doc = _parse_edoc({"edoc": edoc})
+    lb = doc.get("liveboard") if isinstance(doc, dict) else None
+    if not lb or lb.get("visualizations") is None:
+        return edoc, 0, 0
+    targets = {str(v).strip() for v in (viz_ids or []) if str(v).strip()}
+    before = len(lb["visualizations"])
+    lb["visualizations"] = [v for v in lb["visualizations"]
+                            if str(v.get("id") or v.get("viz_id") or "") not in targets]
+    remaining = len(lb["visualizations"])
+    layout = lb.get("layout") or {}
+
+    def _prune(tiles):
+        return [t for t in tiles
+                if str(t.get("visualization_id", "")) not in targets]
+
+    if isinstance(layout.get("tiles"), list):
+        layout["tiles"] = _prune(layout["tiles"])
+    for tab in (layout.get("tabs") or []):
+        if isinstance(tab.get("tiles"), list):
+            tab["tiles"] = _prune(tab["tiles"])
+    return json.dumps(doc), before - remaining, remaining
+
+
+def dependents_using_columns(dependents, dropped_names):
+    """Narrow TABLE-level dependents down to the ones that actually reference a DROPPED COLUMN.
+
+    `list_dependents` answers "what depends on this table", which is far too broad: dropping one
+    column of a 45-column table would otherwise implicate every answer built on it. So each
+    candidate's own TML is scanned for a reference to the specific columns going away.
+
+    `dependents`: [{"id", "name", "type", "tml": str|dict}] — tml as exported from the TARGET.
+    `dropped_names`: the names to look for. Pass BOTH spellings of each column, its display name
+    and its physical db_column_name, because a dependent refers to it by display name while the
+    drop set is keyed on the physical one.
+
+    Returns [{"id", "name", "type", "columns": [names actually referenced], "certain": bool}].
+    `certain` is False when the dependent's TML could not be read, in which case it is still
+    reported — an unreadable dependent is a reason for caution, not a reason to go quiet.
+
+    IMPORTANT: this can only see dependents the calling account can see. It does not, and cannot,
+    prove that nothing else depends on the column."""
+    want = {(n or "").strip().lower() for n in (dropped_names or ()) if (n or "").strip()}
+    if not want:
+        return []
+    out = []
+    for d in dependents or []:
+        tml = d.get("tml")
+        if not tml:
+            out.append({"id": d.get("id"), "name": d.get("name"), "type": d.get("type"),
+                        "columns": [], "vizzes": [], "viz_total": 0, "certain": False})
+            continue
+        try:
+            doc = tml if isinstance(tml, dict) else (
+                json.loads(tml) if str(tml).strip().startswith("{") else _yaml_load(tml))
+        except Exception:
+            out.append({"id": d.get("id"), "name": d.get("name"), "type": d.get("type"),
+                        "columns": [], "certain": False})
+            continue
+        def _refs(node):
+            """Which of the wanted names this subtree mentions."""
+            found = set()
+            for txt in _iter_strings(node):
+                low = txt.strip().lower()
+                if low in want:                    # a bare name (answer_columns, viz column)
+                    found.add(low)
+                for inner in _BRACKET_REF.findall(txt):   # [Display] / [table::COL] in a formula
+                    tail = inner.split("::")[-1].strip().lower()
+                    if tail in want:
+                        found.add(tail)
+                    elif inner.strip().lower() in want:
+                        found.add(inner.strip().lower())
+            return found
+
+        hit = _refs(doc)
+        # For a LIVEBOARD, say WHICH tiles are involved. A board can have many, and only some use
+        # the column — naming the viz lets the operator judge the blast radius (and remove just
+        # that tile in the product) instead of treating the whole board as lost.
+        vizzes = []
+        lb = doc.get("liveboard") if isinstance(doc, dict) else None
+        for viz in ((lb or {}).get("visualizations") or []):
+            if _refs(viz):
+                vid = viz.get("id") or viz.get("viz_id") or ""
+                nm = ((viz.get("answer") or {}).get("name")
+                      or viz.get("name") or "")
+                vizzes.append({"id": str(vid), "name": nm})
+        if hit:
+            out.append({"id": d.get("id"), "name": d.get("name"), "type": d.get("type"),
+                        "columns": sorted(hit), "vizzes": vizzes,
+                        "viz_total": len((lb or {}).get("visualizations") or []) if lb else 0,
+                        "certain": True})
+    return out
+
+
+def promotion_plan(model_ids, table_ids, id2name, present, selected):
+    """What leaving an object out of the promotion set actually means.
+
+    `selected` = ids ticked to promote. `present` = names that already exist on the TARGET (names
+    are preserved across clusters, so presence is by name). Returns a dict:
+
+      excluded       ids not being promoted
+      unsafe         MODEL names left out that are NOT on the target — there is nothing to bind to
+                     and nothing sensible to prune, so the page must block on these
+      safe_skips     table names left out that ARE on the target — the model binds to that copy and
+                     nothing is dropped
+      prune          table names left out that are NOT on the target — they must be pruned out of
+                     the model, which drops whatever referenced them (gated by an acknowledgement)
+
+    Pulled out of the Select page so the consequence of a tick is unit-testable rather than
+    entangled with widget state: the four cases differ in what they destroy, and getting one wrong
+    silently changes what lands on the target."""
+    sel = set(selected or ())
+    excluded, unsafe, safe_skips, prune = set(), [], [], []
+    for i in model_ids or ():
+        if i in sel:
+            continue
+        excluded.add(i)
+        nm = id2name.get(i, i)
+        if nm not in present:
+            unsafe.append(nm)
+    for i in table_ids or ():
+        nm = id2name.get(i, i)
+        if i in sel:
+            continue
+        excluded.add(i)
+        (safe_skips if nm in present else prune).append(nm)
+    return {"excluded": excluded, "unsafe": unsafe,
+            "safe_skips": safe_skips, "prune": prune}
+
+
+def restore_unneeded_type_changes(items, source_items):
+    """Put back any declared type this tool changed that did not need changing.
+
+    Compares the bundle against the RAW SOURCE TML. A column whose type differs from the source
+    but stays in the same storage CLASS (int / float / str / bool / date) was rewritten for no
+    reason the platform cares about — INT64 to INT32 being the case that reached a customer — so the
+    source's own type is restored. A difference that crosses a class (VARCHAR to INT64) is a
+    deliberate realignment and is left alone.
+
+    This repairs the bundle IN PLACE. Pruning the approval map only stops future exports; the type
+    is already written into the items, and on the validation page there is no re-export to catch
+    it. Returns (new_items, [(table, column, from, to), …])."""
+    src = {}
+    for item in source_items or []:
+        try:
+            doc = _parse_edoc(item)
+        except Exception:
+            continue
+        t = doc.get("table")
+        if not (t and t.get("name")):
+            continue
+        tl = t["name"].strip().lower()
+        for c in t.get("columns") or []:
+            dt = (c.get("db_column_properties") or {}).get("data_type") or ""
+            for key in ((c.get("name") or "").strip().lower(),
+                        (c.get("db_column_name") or "").strip().lower()):
+                if key and dt:
+                    src[(tl, key)] = dt
+    if not src:
+        return items, []
+    restored, out = [], []
+    for item in items:
+        try:
+            doc = _parse_edoc(item)
+        except Exception:
+            out.append(item)
+            continue
+        t = doc.get("table")
+        touched = False
+        if t and t.get("name"):
+            tl = t["name"].strip().lower()
+            for c in t.get("columns") or []:
+                cur = (c.get("db_column_properties") or {}).get("data_type") or ""
+                want = (src.get((tl, (c.get("name") or "").strip().lower()))
+                        or src.get((tl, (c.get("db_column_name") or "").strip().lower())))
+                if not (cur and want) or cur.strip().upper() == want.strip().upper():
+                    continue
+                if type_class(cur) and type_class(cur) == type_class(want):
+                    c["db_column_properties"]["data_type"] = want
+                    restored.append((t["name"], c.get("db_column_name") or c.get("name"),
+                                     cur, want))
+                    touched = True
+        out.append({**item, "edoc": json.dumps(doc)} if touched else item)
+    return out, restored
+
+
+def prune_stale_realignments(items, realign):
+    """Split a durable realign map into the entries that still change something and the ones that
+    no longer do. Returns (kept, dropped) as {"table::col": type} dicts.
+
+    Approvals outlive the rule that asked for them. When the flagging rule tightened and then
+    loosened again, integer-width approvals stayed in the map and kept rewriting types nobody
+    needed rewritten. Rather than leaving that for the operator to notice, the map is pruned on
+    every export against what the TML actually says, so a realignment that is no longer a class
+    change simply stops existing."""
+    if not realign:
+        return {}, {}
+    current = {}
+    for item in items:
+        try:
+            doc = _parse_edoc(item)
+        except Exception:
+            continue
+        t = doc.get("table")
+        if not (t and t.get("name")):
+            continue
+        tl = t["name"].strip().lower()
+        for c in t.get("columns") or []:
+            dt = (c.get("db_column_properties") or {}).get("data_type") or ""
+            for key in ((c.get("name") or "").strip().lower(),
+                        (c.get("db_column_name") or "").strip().lower()):
+                if key:
+                    current[(tl, key)] = dt
+    kept, dropped = {}, {}
+    for k, v in realign.items():
+        if "::" not in (k or ""):
+            continue
+        _t, _c = k.split("::", 1)
+        cur = current.get((_t.strip().lower(), _c.strip().lower()))
+        if cur is not None and type_class(cur) and type_class(cur) == type_class(v):
+            dropped[k] = v
+        else:
+            kept[k] = v
+    return kept, dropped
+
+
+def recase_columns(items, case_map):
+    """In-place physical-name recasing: set each table column's db_column_name to the warehouse's
+    actual casing. Mirrors the transformer's recasing rule (transform_doc) but applied to an
+    already-built bundle, so an approved recasing takes effect WITHOUT a full re-export.
+
+    `case_map`: {table_name_lower: {db_column_name_lower: actual_case}} — already filtered to the
+    approved subset. Only the physical `db_column_name` is touched; the logical `name` is left alone
+    so references by name still resolve. Returns (new_items, count_changed)."""
+    out, n = [], 0
+    for item in items:
+        doc = _parse_edoc(item)
+        t = doc.get("table")
+        if t and t.get("columns"):
+            cc = case_map.get((t.get("name", "") or "").strip().lower())
+            if cc:
+                for col in t["columns"]:
+                    dbn = col.get("db_column_name")
+                    if dbn:
+                        tgt = cc.get(dbn.strip().lower())
+                        if tgt and tgt != dbn:
+                            col["db_column_name"] = tgt
+                            n += 1
+        out.append({**item, "edoc": json.dumps(doc)})
+    return out, n
+
+
+def drop_vizzes(items, viz_ids):
+    """Remove specific visualizations (by id) from any liveboard in `items`, and prune any
+    layout tiles that referenced them (flat layout.tiles or tabbed layout.tabs[].tiles).
+    Used to drop a viz that fails to load (e.g. a formula that won't compile) so the rest of
+    the liveboard imports. Returns (new_items, dropped_count)."""
+    targets = {str(v).strip() for v in viz_ids}
+    dropped = 0
+    out = []
+    for item in items:
+        edoc = item.get("edoc", "{}")
+        doc = json.loads(edoc) if isinstance(edoc, str) and edoc.strip().startswith("{") \
+            else (_yaml_load(edoc) if isinstance(edoc, str) else edoc)
+        lb = doc.get("liveboard")
+        if lb and lb.get("visualizations") is not None:
+            kept, kept_ids = [], set()
+            for viz in lb["visualizations"]:
+                vid = str(viz.get("id") or viz.get("viz_id") or "")
+                if vid in targets:
+                    dropped += 1
+                else:
+                    kept.append(viz)
+                    kept_ids.add(vid)
+            lb["visualizations"] = kept
+
+            layout = lb.get("layout") or {}
+
+            def _prune(tiles):
+                return [t for t in tiles if str(t.get("visualization_id", "")) in kept_ids]
+
+            if isinstance(layout.get("tiles"), list):
+                layout["tiles"] = _prune(layout["tiles"])
+            if isinstance(layout.get("tabs"), list):
+                for tab in layout["tabs"]:
+                    if isinstance(tab.get("tiles"), list):
+                        tab["tiles"] = _prune(tab["tiles"])
+
+        out.append({**item, "edoc": json.dumps(doc)})
+    return out, dropped
+
+
+def _refs_table_prefix(obj, table_targets):
+    """True if any `[table::col]` reference inside obj names a table in table_targets
+    (matched on the part BEFORE `::`, i.e. the table, not the column)."""
+    for expr in _iter_strings(obj):
+        for inner in _BRACKET_REF.findall(expr):
+            if "::" in inner and inner.split("::")[0].strip().lower() in table_targets:
+                return True
+    return False
+
+
+def _model_table_columns(docs, table_targets):
+    """Column keys (db-name + display, lowercased) for every model column belonging to a
+    target table (matched by column_id prefix), plus the display names for reporting."""
+    keys, display = set(), []
+    for doc in docs:
+        for key in ("model", "worksheet"):
+            node = doc.get(key)
+            if not node:
+                continue
+            for c in node.get("columns", []) or []:
+                cid = c.get("column_id", "") or ""
+                if "::" in cid and cid.split("::")[0].strip().lower() in table_targets:
+                    keys.add(cid.split("::")[-1].strip().lower())
+                    nm = (c.get("name") or "").strip()
+                    keys.add(nm.lower() if nm else cid.split("::")[-1].strip().lower())
+                    display.append(nm or cid.split("::")[-1])
+    return keys, display
+
+
+def _refs_formula(obj, formula_ids):
+    """True if any `[formula_x]` reference inside obj points at a formula id in formula_ids."""
+    for expr in _iter_strings(obj):
+        for inner in _BRACKET_REF.findall(expr):
+            if inner.strip().lower() in formula_ids:
+                return True
+    return False
+
+
+def _formula_id(f):
+    return (f.get("id") or ("formula_" + (f.get("name", "") or ""))).strip().lower()
+
+
+def _surfaces_dropped_formula(col, dropped_fids, dropped_fnames):
+    """True when a model column exists only to surface one of the dropped formulas.
+
+    A formula-backed column binds to its formula in three different ways depending on how the TML
+    was written: an explicit `formula_id`, a `column_id` of `formula_<name>`, or nothing at all but
+    a matching `name`. drop_columns() has always handled all three; drop_tables() checked only
+    `formula_id`, so pruning a whole table removed the formula and left its column behind pointing
+    at nothing. ThoughtSpot reports that as "Unable to create model column(s). These column_id/
+    formula_id values are incorrect" — the same shape as a real customer failure — or as an opaque schema
+    validation error. Found by the property suite, not in the field."""
+    fid = (col.get("formula_id", "") or "").strip().lower()
+    if fid and fid in dropped_fids:
+        return True
+    cid = (col.get("column_id", "") or "").strip().lower()
+    if cid and cid in dropped_fids:
+        return True
+    if cid.startswith("formula_") and cid[len("formula_"):] in dropped_fnames:
+        return True
+    # No binding of any kind: a column is a formula column only if its NAME is a dropped formula's
+    # AND it carries no physical `table::col` id.
+    if not cid and not fid:
+        return (col.get("name", "") or "").strip().lower() in dropped_fnames
+    return False
+
+
+def _table_drop_plan(items, table_names):
+    """Full transitive closure of what pruning `table_names` removes from the model(s): the
+    tables + attaching joins + their physical columns, then by FIXPOINT every formula that
+    references those columns (or another dropped formula), the formula-backed columns those
+    formulas back, and dependent leaf vizzes. Returns removal sets (targets, dropped_fids,
+    dropped_col_names) plus human-readable lists (columns, joins, formulas, vizzes)."""
+    targets = {t.strip().lower() for t in table_names}
+    docs = [_parse_edoc(it) for it in items]
+    phys_keys, phys_display = _model_table_columns(docs, targets)
+
+    all_formulas = []
+    for doc in docs:
+        for key in ("model", "worksheet"):
+            node = doc.get(key)
+            if node:
+                all_formulas += (node.get("formulas") or [])
+
+    dropped_fids = set()
+    changed = True
+    while changed:
+        changed = False
+        for f in all_formulas:
+            fid = _formula_id(f)
+            if fid in dropped_fids:
+                continue
+            if _refs_table_prefix(f, targets) or _refs_formula(f, dropped_fids):
+                dropped_fids.add(fid)
+                changed = True
+
+    dropped_formula_names = [f.get("name") or f.get("id") for f in all_formulas
+                             if _formula_id(f) in dropped_fids]
+    # The NAMES of the dropped formulas, for the column that surfaces one purely by name.
+    _dropped_fnames = {(n or "").strip().lower() for n in dropped_formula_names if n}
+
+    formula_col_names = []
+    for doc in docs:
+        for key in ("model", "worksheet"):
+            node = doc.get(key)
+            if not node:
+                continue
+            for c in node.get("columns", []) or []:
+                if _surfaces_dropped_formula(c, dropped_fids, _dropped_fnames):
+                    formula_col_names.append(c.get("name") or c.get("formula_id")
+                                             or c.get("column_id"))
+
+    dropped_col_names = set(phys_keys) | {(n or "").strip().lower() for n in formula_col_names if n}
+
+    joins = []
+    for doc in docs:
+        for key in ("model", "worksheet"):
+            node = doc.get(key)
+            if not node:
+                continue
+            for mt in (node.get("model_tables") or []):
+                for j in mt.get("joins", []) or []:
+                    if ((mt.get("name", "") or "").strip().lower() in targets
+                            or (j.get("with", "") or "").strip().lower() in targets
+                            or _refs_table_prefix(j, targets)):
+                        joins.append(j.get("name") or f"{mt.get('name','')} -> {j.get('with','')}")
+
+    vizzes = []
+    for doc in docs:
+        lb = doc.get("liveboard")
+        if lb:
+            for viz in lb.get("visualizations", []) or []:
+                ac = [(c.get("name", "") or "").strip().lower()
+                      for c in viz.get("answer", {}).get("answer_columns", [])]
+                if any(a in dropped_col_names for a in ac) or _expr_refs(viz, dropped_col_names, dropped_col_names):
+                    vizzes.append(viz.get("id") or viz.get("viz_id") or "(viz)")
+        ans = doc.get("answer")
+        if ans:
+            ac = [(c.get("name", "") or "").strip().lower() for c in ans.get("answer_columns", [])]
+            if any(a in dropped_col_names for a in ac) or _expr_refs(ans, dropped_col_names, dropped_col_names):
+                vizzes.append(ans.get("name") or "(answer)")
+
+    return {
+        "targets":           targets,
+        "dropped_fids":      dropped_fids,
+        "dropped_col_names": dropped_col_names,
+        "columns":  sorted(set(phys_display) | {n for n in formula_col_names if n}),
+        "joins":    sorted(set(joins)),
+        "formulas": sorted(set(dropped_formula_names)),
+        "vizzes":   list(dict.fromkeys(vizzes)),
+    }
+
+
+def table_drop_preview(items, table_name):
+    """Read-only preview of what pruning `table_name` out of the model(s) would remove — the
+    table's columns, attaching joins, formulas that use it (transitively), the formula-backed
+    columns those formulas back, and dependent leaf vizzes."""
+    plan = _table_drop_plan(items, [table_name])
+    return {k: plan[k] for k in ("columns", "joins", "formulas", "vizzes")}
+
+
+def drop_tables(items, table_names):
+    """Prune whole tables out of the model(s): remove their model_tables entry + attaching
+    joins + physical columns + (transitively) formulas that use them + the formula-backed
+    columns those formulas back, and drop dependent leaf vizzes (and layout tiles). Use when a
+    table is EXCLUDED but NOT on the target, so the model must stop referencing it. Returns
+    (new_items, summary counts)."""
+    plan = _table_drop_plan(items, table_names)
+    targets, dropped_fids, dcn = plan["targets"], plan["dropped_fids"], plan["dropped_col_names"]
+    summary = {"tables": 0, "columns": 0, "joins": 0, "formulas": 0, "vizzes": 0}
+    if not targets:
+        return items, summary
+    out = []
+    for item in items:
+        doc = _parse_edoc(item)
+        for key in ("model", "worksheet"):
+            node = doc.get(key)
+            if not node:
+                continue
+            mts = node.get("model_tables")
+            if isinstance(mts, list):
+                kept_mt = []
+                for mt in mts:
+                    if (mt.get("name", "") or "").strip().lower() in targets:
+                        summary["tables"] += 1
+                        continue   # drop the whole table entry (its joins go with it)
+                    if isinstance(mt.get("joins"), list):
+                        kj = []
+                        for j in mt["joins"]:
+                            if (j.get("with", "") or "").strip().lower() in targets or _refs_table_prefix(j, targets):
+                                summary["joins"] += 1
+                            else:
+                                kj.append(j)
+                        mt["joins"] = kj
+                    kept_mt.append(mt)
+                node["model_tables"] = kept_mt
+            _dropped_fnames = {(f.get("name") or "").strip().lower()
+                               for f in (node.get("formulas") or [])
+                               if _formula_id(f) in dropped_fids and f.get("name")}
+            if isinstance(node.get("formulas"), list):
+                before = len(node["formulas"])
+                node["formulas"] = [f for f in node["formulas"] if _formula_id(f) not in dropped_fids]
+                summary["formulas"] += before - len(node["formulas"])
+            if isinstance(node.get("columns"), list):
+                before = len(node["columns"])
+                node["columns"] = [
+                    c for c in node["columns"]
+                    if not (("::" in (c.get("column_id", "") or "")
+                             and (c.get("column_id", "")).split("::")[0].strip().lower() in targets)
+                            # every way a column can bind to a dropped formula, not just formula_id
+                            or _surfaces_dropped_formula(c, dropped_fids, _dropped_fnames))
+                ]
+                summary["columns"] += before - len(node["columns"])
+        lb = doc.get("liveboard")
+        if lb and isinstance(lb.get("visualizations"), list):
+            kept, kept_ids = [], set()
+            for viz in lb["visualizations"]:
+                ac = [(c.get("name", "") or "").strip().lower()
+                      for c in viz.get("answer", {}).get("answer_columns", [])]
+                if any(a in dcn for a in ac) or _expr_refs(viz, dcn, dcn):
+                    summary["vizzes"] += 1
+                else:
+                    kept.append(viz)
+                    kept_ids.add(str(viz.get("id") or viz.get("viz_id") or ""))
+            lb["visualizations"] = kept
+            layout = lb.get("layout") or {}
+
+            def _prune(tiles):
+                return [t for t in tiles if str(t.get("visualization_id", "")) in kept_ids]
+
+            if isinstance(layout.get("tiles"), list):
+                layout["tiles"] = _prune(layout["tiles"])
+            if isinstance(layout.get("tabs"), list):
+                for tab in layout["tabs"]:
+                    if isinstance(tab.get("tiles"), list):
+                        tab["tiles"] = _prune(tab["tiles"])
+        out.append({**item, "edoc": json.dumps(doc)})
+    return out, summary
+
+
+NOT_IMPORTED = "NOT_IMPORTED"
+
+
+def all_or_none_outcome(results: List[Dict]) -> Tuple[bool, List[Dict]]:
+    """Read an ALL_OR_NONE import as the platform APPLIED it, not as it REPORTED it.
+
+    When one object in an ALL_OR_NONE batch fails, ThoughtSpot applies none of them but still
+    reports the valid ones as OK, GUID and all. verified on a live cluster 2026-10-16: a model whose
+    description changed, batched with a table carrying a column absent from the warehouse, came
+    back OK, yet the description was unchanged a minute later; the same batch under PARTIAL
+    landed it. Taken at face value those OK rows tell the operator an object was imported when it
+    was not. Returns (landed, rows) with every OK/WARNING row of a failed batch restated as
+    NOT_IMPORTED, so nothing downstream can count it as a success.
+    """
+    def _ok(r):
+        return (r.get("status") or "").upper() in ("OK", "WARNING")
+
+    if all(_ok(r) for r in results):
+        return True, list(results)
+    return False, [
+        {**r, "status": NOT_IMPORTED,
+         "error": "Not imported: another object in the same all-or-nothing batch failed, "
+                  "so ThoughtSpot applied none of them."}
+        if _ok(r) else r
+        for r in results
+    ]

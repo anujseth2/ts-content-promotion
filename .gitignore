@@ -1,0 +1,11 @@
+.env
+.env.seed
+.claude/
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+logs/
+.env.bak*
+*.bak
+config/teams.local.json
